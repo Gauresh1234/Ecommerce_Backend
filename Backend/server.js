@@ -32,6 +32,21 @@ async function ensureAdmin() {
 }
 ensureAdmin();
 
+function verifyAdmin(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(403).json({ message: "Admin token missing" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded.admin) {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+    req.adminId = decoded.adminId;
+    next();
+  } catch (err) {
+    return res.status(403).json({ message: "Invalid admin token" });
+  }
+}
 
 app.post("/api/auth/signup", async (req, res) => {
   try {
@@ -52,9 +67,11 @@ app.post("/api/auth/signup", async (req, res) => {
       [name, email, hash]
     );
     const userId = result.insertId;
+
     const token = jwt.sign({ id: userId, email }, JWT_SECRET, {
       expiresIn: "7d",
     });
+
     res.json({ token, user: { id: userId, name, email } });
   } catch (err) {
     console.error(err);
@@ -71,12 +88,15 @@ app.post("/api/auth/login", async (req, res) => {
     );
     if (!rows.length)
       return res.status(401).json({ message: "Invalid credentials" });
+
     const user = rows[0];
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
+
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, {
       expiresIn: "7d",
     });
+
     res.json({
       token,
       user: { id: user.id, name: user.name, email: user.email },
@@ -87,7 +107,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-
 app.post("/api/admin/login", async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -97,6 +116,7 @@ app.post("/api/admin/login", async (req, res) => {
     );
     if (!rows.length)
       return res.status(401).json({ message: "Invalid admin credentials" });
+
     const admin = rows[0];
     const ok = await bcrypt.compare(password, admin.password_hash);
     if (!ok)
@@ -105,13 +125,13 @@ app.post("/api/admin/login", async (req, res) => {
     const token = jwt.sign({ adminId: admin.id, admin: true }, JWT_SECRET, {
       expiresIn: "7d",
     });
+
     res.json({ token, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
-
 
 app.get("/api/products", async (req, res) => {
   try {
@@ -120,7 +140,6 @@ app.get("/api/products", async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -134,46 +153,109 @@ app.get("/api/products/:id", async (req, res) => {
     );
     if (!rows.length)
       return res.status(404).json({ message: "Product not found" });
+
     res.json(rows[0]);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
+app.get("/api/admin/products", verifyAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT p.*, s.name as seller_name FROM products p LEFT JOIN seller s ON p.seller_id = s.id"
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
-app.post("/api/products", async (req, res) => {
+app.post("/api/admin/products", verifyAdmin, async (req, res) => {
   try {
     const { seller_id, name, description, price, stock, image } = req.body;
+
     const [result] = await pool.query(
       "INSERT INTO products (seller_id, name, description, price, stock, image) VALUES (?, ?, ?, ?, ?, ?)",
       [seller_id, name, description, price, stock, image]
     );
-    res.json({ id: result.insertId });
+
+    res.json({ message: "Product added", productId: result.insertId });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-
-app.get("/api/sellers", async (req, res) => {
+app.put("/api/admin/products/:id", verifyAdmin, async (req, res) => {
   try {
-    const [rows] = await pool.query("SELECT * FROM seller");
+    const id = req.params.id;
+    const { name, description, price, stock, image } = req.body;
+
+    await pool.query(
+      "UPDATE products SET name=?, description=?, price=?, stock=?, image=? WHERE id=?",
+      [name, description, price, stock, image, id]
+    );
+
+    res.json({ message: "Product updated" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/admin/products/:id", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    await pool.query("DELETE FROM products WHERE id=?", [id]);
+
+    res.json({ message: "Product deleted" });
+  } catch (err) {
+    if (err.code === "ER_ROW_IS_REFERENCED_2") {
+      return res.status(400).json({
+        message: "Cannot delete product because it has orders linked to it.",
+      });
+    }
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/api/admin/sellers", verifyAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT * FROM seller ORDER BY created_at DESC"
+    );
     res.json(rows);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
+app.put("/api/admin/sellers/:id/approve", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    await pool.query("UPDATE seller SET status='approved' WHERE id=?", [id]);
+    res.json({ message: "Seller approved" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/admin/sellers/:id", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    await pool.query("DELETE FROM seller WHERE id=?", [id]);
+    res.json({ message: "Seller deleted" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
 app.post("/api/orders", async (req, res) => {
-  
   try {
     const { userId, items, total } = req.body;
     if (!userId || !items || !items.length)
       return res.status(400).json({ message: "Invalid order" });
+
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -182,12 +264,14 @@ app.post("/api/orders", async (req, res) => {
         [userId, total, "placed"]
       );
       const orderId = orderRes.insertId;
+
       for (const it of items) {
         const [p] = await conn.query(
           "SELECT price FROM products WHERE id = ?",
           [it.product_id]
         );
         const unit_price = p.length ? p[0].price : it.unit_price || 0;
+
         await conn.query(
           "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
           [orderId, it.product_id, it.quantity, unit_price]
@@ -198,6 +282,7 @@ app.post("/api/orders", async (req, res) => {
           [it.quantity, it.product_id]
         );
       }
+
       await conn.commit();
       res.json({ message: "Order placed", orderId });
     } catch (e) {
@@ -207,12 +292,11 @@ app.post("/api/orders", async (req, res) => {
       conn.release();
     }
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-app.get("/api/admin/orders", async (req, res) => {
+app.get("/api/admin/orders", verifyAdmin, async (req, res) => {
   try {
     const [orders] = await pool.query(
       "SELECT o.*, u.name as user_name, u.email as user_email FROM orders o LEFT JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC"
@@ -225,25 +309,22 @@ app.get("/api/admin/orders", async (req, res) => {
       );
       o.items = items;
     }
+
     res.json(orders);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-app.get("/api/admin/users", async (req, res) => {
+app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     const [rows] = await pool.query(
       "SELECT id, name, email, created_at FROM users ORDER BY created_at DESC"
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("Server running on port", PORT));
